@@ -2247,6 +2247,7 @@ struct MsgMonitorInstance
 {
 	MsgMonitorInstance *previous;
 	int index;
+	int count;
 };
 
 
