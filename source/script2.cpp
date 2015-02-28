@@ -11743,7 +11743,7 @@ VarSizeType BIV_Caret(LPTSTR aBuf, LPTSTR aVarName)
 	// of where the caret was at one precise instant in time.  This is because the X and Y vars are resolved
 	// separately by the script, and due to split second timing, they might otherwise not be accurate with
 	// respect to each other.  This method also helps performance since it avoids unnecessary calls to
-	// ATTACH_THREAD_INPUT.
+	// GetGUIThreadInfo().
 	static HWND sForeWinPrev = NULL;
 	static DWORD sTimestamp = GetTickCount();
 	static POINT sPoint;
@@ -11762,17 +11762,19 @@ VarSizeType BIV_Caret(LPTSTR aBuf, LPTSTR aVarName)
 	if (target_window != sForeWinPrev || now_tick - sTimestamp > 5) // Different window or too much time has passed.
 	{
 		// Otherwise:
-		ATTACH_THREAD_INPUT
-		sResult = GetCaretPos(&sPoint);
-		HWND focused_control = GetFocus();  // Also relies on threads being attached.
-		DETACH_THREAD_INPUT
+		GUITHREADINFO info;
+		info.cbSize = sizeof(GUITHREADINFO);
+		sResult = GetGUIThreadInfo(GetWindowThreadProcessId(target_window, NULL), &info) // Got info okay...
+			&& info.hwndCaret; // ...and there is a caret.
 		if (!sResult)
 		{
 			*aBuf = '\0';
 			return 0;
 		}
+		sPoint.x = info.rcCaret.left;
+		sPoint.y = info.rcCaret.top;
 		// Unconditionally convert to screen coordinates, for simplicity.
-		ClientToScreen(focused_control ? focused_control : target_window, &sPoint);
+		ClientToScreen(info.hwndCaret, &sPoint);
 		// Now convert back to whatever is expected for the current mode.
 		POINT origin = {0};
 		CoordToScreen(origin, COORD_MODE_CARET);
@@ -18410,26 +18412,22 @@ BIF_DECL(BIF_Exception)
 	{
 #ifdef CONFIG_DEBUGGER
 		int offset = TokenIsPureNumeric(*aParam[1]) ? ParamIndexToInt(1) : 0;
-		if (offset < 0)
+		if (offset < 0 && offset >= (g_Debugger.mStack.mBottom - g_Debugger.mStack.mTop)) // (mBottom - mTop) is safe against overflow, unlike (se >= mBottom). 
 		{
 			DbgStack::Entry *se = g_Debugger.mStack.mTop + offset;
-			if (se >= g_Debugger.mStack.mBottom)
+			// Self-contained loop to ensure the entry belongs to the current thread
+			// (below also relies on this loop to verify se[1].type != SE_Thread):
+			while (++offset <= 0 && g_Debugger.mStack.mTop[offset].type != DbgStack::SE_Thread); // Relies on short-circuit evaluation.
+			if (offset == 1)
 			{
-				// Self-contained loop to ensure the entry belongs to the current thread
-				// (below also relies on this loop to verify se[1].type != SE_Thread):
-				while (++offset <= 0 && g_Debugger.mStack.mTop[offset].type != DbgStack::SE_Thread); // Relies on short-circuit evaluation.
-				if (offset == 1)
-				{
-					line = se->line;
-					// se->line contains the line at the given offset from the top of the stack.
-					// Rather than returning the name of the function or sub which contains that
-					// line, return the name of the function or sub which that line called.
-					// In other words, an offset of -1 gives the name of the current function and
-					// the file and number of the line which it was called from.
-					what = se[1].type == DbgStack::SE_Func ? se[1].func->mName : se[1].sub->mName;
-				}
+				line = se->line;
+				// se->line contains the line at the given offset from the top of the stack.
+				// Rather than returning the name of the function or sub which contains that
+				// line, return the name of the function or sub which that line called.
+				// In other words, an offset of -1 gives the name of the current function and
+				// the file and number of the line which it was called from.
+				what = se[1].type == DbgStack::SE_Func ? se[1].func->mName : se[1].sub->mName;
 			}
-			// Otherwise, not a valid offset.
 		}
 #endif
 		if (!what)

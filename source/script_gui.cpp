@@ -6629,9 +6629,9 @@ ResultType GuiType::Show(LPTSTR aOptions, LPTSTR aText)
 		// account. To account for the scroll bars, call the GetSystemMetrics function with SM_CXVSCROLL
 		// or SM_CYHSCROLL."
 		if (style & WS_HSCROLL)
-			width += GetSystemMetrics(SM_CXHSCROLL);
+			height += GetSystemMetrics(SM_CYHSCROLL);
 		if (style & WS_VSCROLL)
-			height += GetSystemMetrics(SM_CYVSCROLL);
+			width += GetSystemMetrics(SM_CXVSCROLL);
 
 		RECT work_rect;
 		SystemParametersInfo(SPI_GETWORKAREA, 0, &work_rect, 0);  // Get desktop rect excluding task bar.
@@ -8592,7 +8592,7 @@ LRESULT CALLBACK GuiWindowProc(HWND hWnd, UINT iMsg, WPARAM wParam, LPARAM lPara
 		{
 			HWND clicked_hwnd = (HWND)wParam;
 			bool from_keyboard; // Whether Context Menu was generated from keyboard (AppsKey or Shift-F10).
-			if (   !(from_keyboard = (lParam == 0xFFFFFFFF))   ) // Mouse click vs. keyboard event.
+			if (   !(from_keyboard = (lParam == -1))   ) // Mouse click vs. keyboard event.
 			{
 				// If the click occurred above the client area, assume it was in title/menu bar or border.
 				// Let default proc handle it.
