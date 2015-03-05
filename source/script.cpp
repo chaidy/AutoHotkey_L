@@ -210,11 +210,8 @@ Script::~Script() // Destructor.
 	if (g_hFontSplash) // The splash window itself should auto-destroyed, since it's owned by main.
 		DeleteObject(g_hFontSplash);
 
-	if (mOnClipboardChangeLabel) // Remove from viewer chain.
-		if (MyRemoveClipboardListener && MyAddClipboardListener)
-			MyRemoveClipboardListener(g_hWnd); // MyAddClipboardListener was used.
-		else
-			ChangeClipboardChain(g_hWnd, mNextClipboardViewer); // SetClipboardViewer was used.
+	if (mOnClipboardChangeLabel || mOnClipboardChange.Count()) // Remove from viewer chain.
+		EnableClipboardListener(false);
 
 	// Close any open sound item to prevent hang-on-exit in certain operating systems or conditions.
 	// If there's any chance that a sound was played and not closed out, or that it is still playing,
@@ -508,6 +505,19 @@ ResultType Script::CreateWindows()
 		CreateTrayIcon();
 
 	if (mOnClipboardChangeLabel)
+		EnableClipboardListener(true);
+
+	return OK;
+}
+
+
+
+void Script::EnableClipboardListener(bool aEnable)
+{
+	static bool sEnabled = false;
+	if (aEnable == sEnabled) // Simplifies BIF_OnExitOrClipboardChange.
+		return;
+	if (aEnable)
 	{
 		if (MyAddClipboardListener && MyRemoveClipboardListener) // Should be impossible for only one of these to be NULL, but check both anyway to be safe.
 		{
@@ -517,13 +527,30 @@ ResultType Script::CreateWindows()
 			// But this method doesn't appear to send an initial WM_CLIPBOARDUPDATE message.
 			// For consistency with the other method (below) and for backward compatibility,
 			// run the OnClipboardChange label once when the script first starts:
-			PostMessage(g_hWnd, AHK_CLIPBOARD_CHANGE, 0, 0);
+			if (!mIsReadyToExecute)
+			{
+				// Pass 1 for wParam so that MsgSleep() will call only the legacy OnClipboardChange label,
+				// not any functions which are registered between now and when the message is handled.
+				PostMessage(g_hWnd, AHK_CLIPBOARD_CHANGE, 1, 0);
+			}
 		}
 		else
+		{
 			mNextClipboardViewer = SetClipboardViewer(g_hWnd);
+			// SetClipboardViewer() sends a WM_DRAWCLIPBOARD message and causes MainWindowProc()
+			// to be called before returning.  MainWindowProc() posts an AHK_CLIPBOARD_CHANGE
+			// message only if an OnClipboardChange label exists, since mOnClipboardChange.Count()
+			// is always 0 at this point.  It also uses wParam for the reason described above.
+		}
 	}
-
-	return OK;
+	else
+	{
+		if (MyRemoveClipboardListener && MyAddClipboardListener)
+			MyRemoveClipboardListener(g_hWnd); // MyAddClipboardListener was used.
+		else
+			ChangeClipboardChain(g_hWnd, mNextClipboardViewer); // SetClipboardViewer was used.
+	}
+	sEnabled = aEnable;
 }
 
 
@@ -806,23 +833,21 @@ ResultType Script::ExitApp(ExitReasons aExitReason, LPTSTR aBuf, int aExitCode)
 		MessageBox(g_hWnd, buf, g_script.mFileSpec, MB_OK | MB_SETFOREGROUND | MB_APPLMODAL);
 		TerminateApp(aExitReason, CRITICAL_ERROR); // Only after the above.
 	}
-
-	// Otherwise, it's not a critical error.  Note that currently, mOnExitLabel can only be
-	// non-NULL if the script is in a runnable state (since registering an OnExit label requires
-	// that a script command has executed to do it).  If this ever changes, the !mIsReadyToExecute
-	// condition should be added to the below if statement:
-	static bool sExitLabelIsRunning = false;
-	if (!mOnExitLabel || sExitLabelIsRunning)  // || !mIsReadyToExecute
+	// Otherwise, it's not a critical error.
+	static bool sOnExitIsRunning = false, sExitAppShouldTerminate = true;
+	if (sOnExitIsRunning || !mIsReadyToExecute)
 	{
-		// In the case of sExitLabelIsRunning == true:
-		// There is another instance of this function beneath us on the stack.  Since we have
-		// been called, this is a true exit condition and we exit immediately.
-		// MUST NOT create a new thread when sExitLabelIsRunning because g_array allows only one
-		// extra thread for ExitApp() (which allows it to run even when MAX_THREADS_EMERGENCY has
-		// been reached).  See TOTAL_ADDITIONAL_THREADS.
-		g_AllowInterruption = FALSE; // In case TerminateApp releases objects and indirectly causes
-		g->IsPaused = false;		 // more script to be executed.
-		TerminateApp(aExitReason, aExitCode);
+		// There is another instance of this function beneath us on the stack, executing an
+		// OnExit subroutine or function.  If a legacy OnExit sub is running, we still need
+		// to execute any other OnExit callbacks before exiting.  Otherwise ExitApp should
+		// terminate the app.
+		if (sExitAppShouldTerminate)
+			TerminateApp(aExitReason, aExitCode); // exit early for maintainability.
+		sExitAppShouldTerminate = true; // Signal our other instance that ExitApp was called.
+		return EARLY_EXIT; // Exit the thread (our other instance will call TerminateApp).
+		// MUST NOT create a new thread when sOnExitIsRunning because g_array allows only one
+		// extra thread for ExitApp() (which allows it to run even when MAX_THREADS_EMERGENCY
+		// has been reached).  See TOTAL_ADDITIONAL_THREADS for details.
 	}
 
 	// Otherwise, the script contains the special RunOnExit label that we will run here instead
@@ -864,19 +889,42 @@ ResultType Script::ExitApp(ExitReasons aExitReason, LPTSTR aBuf, int aExitCode)
 	BOOL g_AllowInterruption_prev = g_AllowInterruption;  // Save current setting.
 	g_AllowInterruption = FALSE; // Mark the thread just created above as permanently uninterruptible (i.e. until it finishes and is destroyed).
 
-	sExitLabelIsRunning = true;
+	sOnExitIsRunning = true;
+	DEBUGGER_STACK_PUSH(_T("OnExit"))
+
+	terminate_afterward = true; // Set default - see below for comments.
 	
-	if (mOnExitLabel->ExecuteInNewThread(_T("OnExit")) == FAIL)
+	// When a legacy OnExit label is present, the default behaviour is to exit the script only if
+	// it calls ExitApp.  Therefore to make OnExit() useful in a script which uses legacy OnExit,
+	// we need to prevent ExitApp from actually terminating the app:
+	sExitAppShouldTerminate = false;
+	// If the subroutine encounters a failure condition such as a runtime error, exit afterward.
+	// Otherwise, there will be no way to exit the script if the subroutine fails on each attempt.
+	if (mOnExitLabel && mOnExitLabel->Execute() && !sExitAppShouldTerminate)
 	{
-		// If the subroutine encounters a failure condition such as a runtime error, exit immediately.
-		// Otherwise, there will be no way to exit the script if the subroutine fails on each attempt.
-		TerminateApp(aExitReason, aExitCode);
+		// The subroutine completed normally and did not call ExitApp, so don't exit.
+		terminate_afterward = false;
+	}
+	sExitAppShouldTerminate = true;
+
+	// If an OnExit label was called and didn't call ExitApp, terminate_afterward was set to false,
+	// so the script isn't exiting.  Otherwise, call the chain of OnExit functions:
+	if (terminate_afterward)
+	{
+		ExprTokenType param (GetExitReasonString(aExitReason));
+		if (mOnExit.Call(&param, 1, mOnExitLabel ? 0 : 1) == CONDITION_TRUE)
+			terminate_afterward = false; // A handler returned true to prevent exit.
 	}
 	
-	sExitLabelIsRunning = false;  // In case the user wanted the thread to end normally (see above).
+	DEBUGGER_STACK_POP()
+	sOnExitIsRunning = false;  // In case the user wanted the thread to end normally (see above).
 
 	if (terminate_afterward)
+	{
+		g_AllowInterruption = FALSE; // In case TerminateApp releases objects and indirectly causes
+		g->IsPaused = false;		 // more script to be executed.
 		TerminateApp(aExitReason, aExitCode);
+	}
 
 	// Otherwise:
 	ResumeUnderlyingThread(ErrorLevel_saved);
@@ -8175,6 +8223,11 @@ Func *Script::FindFunc(LPCTSTR aFuncName, size_t aFuncNameLength, int *apInsertP
 		// override the default set here.
 		g_persistent = true;
 	}
+	else if (!_tcsicmp(func_name, _T("OnExit")) || !_tcsicmp(func_name, _T("OnClipboardChange")))
+	{
+		bif = BIF_OnExitOrClipboard;
+		max_params = 2;
+	}
 #ifdef ENABLE_REGISTERCALLBACK
 	else if (!_tcsicmp(func_name, _T("RegisterCallback")))
 	{
@@ -9738,7 +9791,7 @@ Line *Script::PreparseCommands(Line *aStartingLine)
 		// so that labels both above and below this line can be resolved:
 		case ACT_ONEXIT:
 			if (*line_raw_arg1 && !line->ArgHasDeref(1))
-				if (   !(line->mAttribute = FindCallable(line_raw_arg1))   )
+				if (   !(line->mAttribute = FindLabel(line_raw_arg1))   )
 					return line->PreparseError(ERR_NO_LABEL);
 			break;
 
@@ -13707,7 +13760,6 @@ __forceinline ResultType Line::Perform() // As of 2/9/2009, __forceinline() redu
 	size_t source_length; // For String commands.
 	SymbolType var_is_pure_numeric, value_is_pure_numeric; // For math operations.
 	vk_type vk; // For GetKeyState.
-	IObject *target_label;  // For ACT_SETTIMER, ACT_HOTKEY and ACT_ONEXIT
 	__int64 device_id;  // For sound commands.  __int64 helps avoid compiler warning for some conversions.
 	bool is_remote_registry; // For Registry commands.
 	HKEY root_key; // For Registry commands.
@@ -14344,21 +14396,29 @@ __forceinline ResultType Line::Perform() // As of 2/9/2009, __forceinline() redu
 		return OK;
 
 	case ACT_ONEXIT:
+	{
+		Label *target_label;
 		// If it wasn't resolved at load-time, it must be a variable reference:
-		if (   !(target_label = (IObject *)mAttribute)   )
-			if (   !(target_label = g_script.FindCallable(ARG1, ARGVAR1)) && *ARG1   )
+		if (   !(target_label = (Label *)mAttribute)   )
+			if (   *ARG1 && !(target_label = g_script.FindLabel(ARG1))   )
 					return LineError(ERR_NO_LABEL, FAIL, ARG1);
 		g_script.mOnExitLabel = target_label;
 		return OK;
+	}
 
 	case ACT_HOTKEY:
+	{
+		IObject *target_label;
 		// mAttribute is the label resolved at loadtime, if available (for performance).
 		if (   !(target_label = (IObject *)mAttribute)   ) // Since it wasn't resolved at load-time, it must be a variable reference.
 			if (ARGVAR2 && ARGVAR2->HasObject()) // Allow: Hotkey %KeyName%, %VarWithObject%
 				target_label = ARGVAR2->Object(); // AddRef() will be called later, when it is stored.
 		return Hotkey::Dynamic(THREE_ARGS, target_label);
+	}
 
 	case ACT_SETTIMER: // A timer is being created, changed, or enabled/disabled.
+	{
+		IObject *target_label;
 		// Note that only one timer per label is allowed because the label is the unique identifier
 		// that allows us to figure out whether to "update or create" when searching the list of timers.
 		if (   !(target_label = (IObject *)mAttribute)   ) // Since it wasn't resolved at load-time, it must be a variable reference.
@@ -14401,6 +14461,7 @@ __forceinline ResultType Line::Perform() // As of 2/9/2009, __forceinline() redu
 		default: g_script.UpdateOrCreateTimer(target_label, ARG2, ARG3, true, !*ARG2 && *ARG3);
 		}
 		return OK;
+	}
 
 	case ACT_CRITICAL:
 	{
